@@ -2442,6 +2442,8 @@ sub actor_died_or_disappeared {
 		} elsif ($args->{type} == 1) {
 			debug "Monster Died: " . $monster->name . " ($monster->{binID})\n", "parseMsg_damage";
 			$monster->{dead} = 1;
+			$self->{_last_killed_monster_nameID} = $monster->{nameID};
+			$self->{_last_killed_monster_time} = time;
 
 			if ((AI::action() ne "attack" || AI::args(0)->{ID} eq $ID) &&
 				($config{itemsTakeAuto_party} &&
@@ -4632,6 +4634,32 @@ sub progress_bar_stop {
 # 02b1 <packet len>.W <num>.L { <quest id>.L <active>.B }*num (ZC_ALL_QUEST_LIST)
 # 097a <packet len>.W <num>.L { <quest id>.L <active>.B <remaining time>.L <time>.L <count>.W { <mob_id>.L <killed>.W <total>.W <mob name>.24B }*count }*num (ZC_ALL_QUEST_LIST2)
 # 09f8 <packet len>.W <num>.L { <quest id>.L <active>.B <remaining time>.L <time>.L <count>.W { <hunt identification>.L <mob type>.L <mob_id>.L <min level>.W <max level>.W <killed>.W <total>.W <mob name>.24B }*count }*num  (ZC_ALL_QUEST_LIST3)
+sub _quest_resolve_mob_name {
+	my ($mob_id, $packet_name_raw) = @_;
+	my $packet_name = bytesToString($packet_name_raw // '');
+	$packet_name =~ s/\x00+$//;
+	my $has_control_chars = $packet_name =~ /[\x00-\x08\x0B\x0C\x0E-\x1F]/;
+
+	if (defined $mob_id && defined $monsters_lut{$mob_id} && ($packet_name eq '' || $has_control_chars)) {
+		return $monsters_lut{$mob_id};
+	}
+
+	return $packet_name;
+}
+
+sub _quest_normalize_time_window {
+	my ($time_start, $time_expire) = @_;
+	return ($time_start, $time_expire) if !defined $time_start || !defined $time_expire;
+	return ($time_start, $time_expire) if !$time_start || !$time_expire;
+
+	# Some servers can send start/expire reversed.
+	if ($time_start > $time_expire) {
+		return ($time_expire, $time_start);
+	}
+
+	return ($time_start, $time_expire);
+}
+
 sub quest_all_list {
 	my ( $self, $args ) = @_;
 
@@ -4692,32 +4720,35 @@ sub quest_all_list {
 	}
 
 	for (my $i = 0 ; $i < $args->{quest_amount} ; $i++) {
-        my $quest;
+		my $quest;
 
-        @{$quest}{@{$quest_info->{quest_keys}}} = unpack($quest_info->{quest_pack}, substr($args->{message}, $offset, $quest_info->{quest_len}));
+		@{$quest}{@{$quest_info->{quest_keys}}} = unpack($quest_info->{quest_pack}, substr($args->{message}, $offset, $quest_info->{quest_len}));
+		if (exists $quest->{time_start} && exists $quest->{time_expire}) {
+			($quest->{time_start}, $quest->{time_expire}) = _quest_normalize_time_window($quest->{time_start}, $quest->{time_expire});
+		}
 
-        %{$questList->{$quest->{quest_id}}} = %$quest;
+		%{$questList->{$quest->{quest_id}}} = %$quest;
 
-        debug "Quest ID: $quest->{quest_id} - active: $quest->{active}\n", "info";
+		debug "Quest ID: $quest->{quest_id} - active: $quest->{active}\n", "info";
 
-        $offset += $quest_info->{quest_len};
+		$offset += $quest_info->{quest_len};
 
-        next if !exists $quest->{mission_amount};
+		next if !exists $quest->{mission_amount};
 
-        debug "- Mission amount: $quest->{mission_amount}\n", "info";
+		debug "- Mission amount: $quest->{mission_amount}\n", "info";
 
-        for ( my $j = 0 ; $j < $quest->{mission_amount}; $j++ ) {
-            my $mission;
+		for ( my $j = 0 ; $j < $quest->{mission_amount}; $j++ ) {
+			my $mission;
 
-            @{$mission}{@{$quest_info->{mission_keys}}} = unpack($quest_info->{mission_pack}, substr($args->{message}, $offset, $quest_info->{mission_len}));
-			$mission->{mob_name} = bytesToString($mission->{mob_name_original});
-            $mission->{mission_index} = $j;
+			@{$mission}{@{$quest_info->{mission_keys}}} = unpack($quest_info->{mission_pack}, substr($args->{message}, $offset, $quest_info->{mission_len}));
+			$mission->{mob_name} = _quest_resolve_mob_name($mission->{mob_id}, $mission->{mob_name_original});
+			$mission->{mission_index} = $j;
 
-            %{$questList->{$quest->{quest_id}}->{missions}->{$mission->{mob_id}}} = %$mission;
+			%{$questList->{$quest->{quest_id}}->{missions}->{$mission->{mob_id}}} = %$mission;
 
-            debug "- MobID: $mission->{mob_id} - Name: $mission->{mob_name} - Count: $mission->{mob_count} - Goal: $mission->{mob_goal}\n", "info";
+			debug "- MobID: $mission->{mob_id} - Name: $mission->{mob_name} - Count: $mission->{mob_count} - Goal: $mission->{mob_goal}\n", "info";
 
-            $offset += $quest_info->{mission_len};
+			$offset += $quest_info->{mission_len};
 
 			Plugins::callHook('quest_mission_added', {
 				questID => $quest->{quest_id},
@@ -4749,6 +4780,9 @@ sub quest_all_mission {
 		my $quest;
 
 		@{$quest}{@{$quest_info->{quest_keys}}} = unpack($quest_info->{quest_pack}, substr($args->{message}, $offset, $quest_info->{quest_len}));
+		if (exists $quest->{time_start} && exists $quest->{time_expire}) {
+			($quest->{time_start}, $quest->{time_expire}) = _quest_normalize_time_window($quest->{time_start}, $quest->{time_expire});
+		}
 
 		my $char_quest = \%{$questList->{$quest->{quest_id}}};
 
@@ -4770,7 +4804,7 @@ sub quest_all_mission {
 			my $mission;
 
 			@{$mission}{@{$quest_info->{mission_keys}}} = unpack($quest_info->{mission_pack}, substr($args->{message}, $offset, $quest_info->{mission_len}));
-			$mission->{mob_name} = bytesToString($mission->{mob_name_original});
+			$mission->{mob_name} = _quest_resolve_mob_name($mission->{mob_id}, $mission->{mob_name_original});
 			$mission->{mission_index} = $j;
 
 			%{$questList->{$char_quest->{quest_id}}->{missions}->{$mission->{mob_id}}} = %$mission;
@@ -4822,10 +4856,11 @@ sub quest_add {
 	}
 
 	my $quest = \%{$questList->{$args->{questID}}};
+	my ($time_start, $time_expire) = _quest_normalize_time_window($args->{time_start}, $args->{time_expire});
 	$quest->{quest_id} = $args->{questID};
 	$quest->{active} = $args->{active};
-	$quest->{time_start} = $args->{time_start};
-	$quest->{time_expire} = $args->{time_expire};
+	$quest->{time_start} = $time_start;
+	$quest->{time_expire} = $time_expire;
 	$quest->{mission_amount} = $args->{mission_amount};
 
 	if ($args->{questID}) {
@@ -4840,7 +4875,7 @@ sub quest_add {
 		my $mission;
 
 		@{$mission}{@{$quest_info->{mission_keys}}} = unpack($quest_info->{mission_pack}, substr($args->{message}, $offset, $quest_info->{mission_len}));
-		$mission->{mob_name} = bytesToString($mission->{mob_name_original});
+		$mission->{mob_name} = _quest_resolve_mob_name($mission->{mob_id}, $mission->{mob_name_original});
 		$mission->{mission_index} = $j;
 
 		%{$questList->{$quest->{quest_id}}->{missions}->{$mission->{mob_id}}} = %$mission;
@@ -4893,20 +4928,61 @@ sub quest_update_mission_hunt {
 		$args->{mission_amount} = (length $args->{message}) / ($quest_info->{mission_len});
 	}
 
+	my %quest_update_seq;
+
 	for (my $i = 0; $i < $args->{mission_amount}; $i++) {
 		my $mission;
 
-		@{$mission}{@{$quest_info->{mission_keys}}} = unpack($quest_info->{mission_pack}, substr($args->{message}, $offset, $quest_info->{mission_len}));
+		my $raw_mission = substr($args->{message}, $offset, $quest_info->{mission_len});
+		$offset += $quest_info->{mission_len};
 
-		next unless exists $questList->{$mission->{questID}};
+		@{$mission}{@{$quest_info->{mission_keys}}} = unpack($quest_info->{mission_pack}, $raw_mission);
+
+		unless (exists $questList->{$mission->{questID}}) {
+			next;
+		}
 
 		my $quest = \%{$questList->{$mission->{questID}}};
+		my $quest_packet_index = $quest_update_seq{$mission->{questID}} // 0;
+		$quest_update_seq{$mission->{questID}} = $quest_packet_index + 1;
 
 		my $mission_id;
+		my $update_without_mob_id = exists $mission->{hunt_id} && !exists $mission->{mob_id};
+		my $hunt_identifier = undef;
+		if (exists $mission->{hunt_id}) {
+			# Some servers send questID in this field instead of a unique hunt identifier.
+			# Treat it as a usable hunt identifier when it looks like questID * 1000 + mission_index.
+			# Accept base value (index 0): e.g. 12086000 for quest 12086 mission 0.
+			my $hunt_base = $mission->{questID} * 1000;
+			$hunt_identifier = $mission->{hunt_id}
+				if $mission->{hunt_id} >= $hunt_base && $mission->{hunt_id} < ($hunt_base + 1000);
+		}
+		if (!defined $hunt_identifier
+			&& exists $mission->{hunt_id_cont}
+			&& $mission->{hunt_id_cont} > 0) {
+			# ROla-like servers can send questID in hunt_id and mission slot in hunt_id_cont.
+			# Rebuild a synthetic hunt identifier to preserve deterministic mission_index mapping.
+			$hunt_identifier = ($mission->{questID} * 1000) + ($mission->{hunt_id_cont} - 1);
+		}
+		my $recent_kill_mission_id;
+		my $used_recent_kill_fallback = 0;
+
+		# For hunt-only updates, if we just killed a monster, that is the strongest
+		# deterministic signal to map the mission.
+		if ($update_without_mob_id
+			&& defined $self->{_last_killed_monster_nameID}
+			&& defined $self->{_last_killed_monster_time}
+			&& time - $self->{_last_killed_monster_time} <= 3) {
+			my @recent_kill_candidates = grep {
+				exists $quest->{missions}->{$_}{mob_id}
+					&& $quest->{missions}->{$_}{mob_id} == $self->{_last_killed_monster_nameID}
+			} keys %{$quest->{missions}};
+			$recent_kill_mission_id = $recent_kill_candidates[0] if @recent_kill_candidates == 1;
+		}
 
 		# Mission is saved as hunt_id and server sent hunt_id
-		if (exists $mission->{hunt_id} && exists $quest->{missions}->{$mission->{hunt_id}}) {
-			$mission_id = $mission->{hunt_id};
+		if (defined $hunt_identifier && exists $quest->{missions}->{$hunt_identifier}) {
+			$mission_id = $hunt_identifier;
 
 		# Mission is saved as mob_id and server sent mob_id
 		} elsif (exists $mission->{mob_id} && exists $quest->{missions}->{$mission->{mob_id}}) {
@@ -4923,10 +4999,10 @@ sub quest_update_mission_hunt {
 			}
 
 		# Mission is saved as mob_id and server sent hunt_id
-		} elsif (exists $mission->{hunt_id} && !exists $quest->{missions}->{$mission->{hunt_id}}) {
+		} elsif (defined $hunt_identifier && !exists $quest->{missions}->{$hunt_identifier}) {
 			# Search in the quest of a mission with this hunt_id
 			foreach my $current_key (keys %{$quest->{missions}}) {
-				if (exists $quest->{missions}->{$current_key}{hunt_id} && $quest->{missions}->{$current_key}{hunt_id} == $mission->{hunt_id}) {
+				if (exists $quest->{missions}->{$current_key}{hunt_id} && $quest->{missions}->{$current_key}{hunt_id} == $hunt_identifier) {
 					$mission_id = $quest->{missions}->{$current_key}{mob_id};
 					last;
 				}
@@ -4935,35 +5011,107 @@ sub quest_update_mission_hunt {
 
 		# Some servers can return mission updates keyed only by hunt identification.
 		# If direct lookup fails, map update by mission index from hunt_id.
-		if (!defined $mission_id && exists $mission->{hunt_id}) {
-			my $mission_index = $mission->{hunt_id} - ($mission->{questID} * 1000);
+		if (!defined $mission_id && defined $hunt_identifier) {
+			my $mission_index = $hunt_identifier - ($mission->{questID} * 1000);
+			my @exact_candidates;
+			my @legacy_candidates;
 
 			foreach my $current_key (keys %{$quest->{missions}}) {
 				next unless exists $quest->{missions}->{$current_key}{mission_index};
-				next unless $quest->{missions}->{$current_key}{mission_index} == $mission_index || $quest->{missions}->{$current_key}{mission_index} == $mission_index - 1;
-				$mission_id = $current_key;
-				last;
+				my $current_index = $quest->{missions}->{$current_key}{mission_index};
+				push @exact_candidates, $current_key if $current_index == $mission_index;
+				push @legacy_candidates, $current_key if $current_index == $mission_index - 1;
+			}
+
+			# Prefer exact mission_index match first.
+			if (@exact_candidates == 1) {
+				$mission_id = $exact_candidates[0];
+			} elsif (!@exact_candidates && @legacy_candidates == 1) {
+				# Compatibility fallback for servers that report mission_index starting at 1.
+				$mission_id = $legacy_candidates[0];
+			} elsif (@exact_candidates > 1 || @legacy_candidates > 1) {
+				debug TF("Quest mission update ignored due to ambiguous hunt mapping (quest: %d, hunt_id: %d, mission_index: %d)\n",
+					$mission->{questID}, $mission->{hunt_id}, $mission_index), "info";
 			}
 		}
 
-		next unless defined $mission_id && exists $quest->{missions}->{$mission_id};
+		# Last-resort fallback for hunt-only updates: preserve packet order within the same quest.
+		if (!defined $mission_id && $update_without_mob_id) {
+			my @index_candidates = grep {
+				exists $quest->{missions}->{$_}{mission_index}
+					&& $quest->{missions}->{$_}{mission_index} == $quest_packet_index
+			} keys %{$quest->{missions}};
+			$mission_id = $index_candidates[0] if @index_candidates == 1;
+		}
+
+		# Fallback only after deterministic mappings fail: use recent kill.
+		if (!defined $mission_id && defined $recent_kill_mission_id) {
+			$mission_id = $recent_kill_mission_id;
+			$used_recent_kill_fallback = 1;
+		}
+
+		# Final fallback for hunt-only updates without usable identifiers:
+		# map by progress delta when there is a single plausible mission.
+		if (!defined $mission_id && $update_without_mob_id) {
+			my @progress_candidates = grep {
+				exists $quest->{missions}->{$_}{mob_count}
+					&& exists $quest->{missions}->{$_}{mob_goal}
+					&& $quest->{missions}->{$_}{mob_count} != $mission->{mob_count}
+					&& $quest->{missions}->{$_}{mob_goal} == $mission->{mob_goal}
+			} keys %{$quest->{missions}};
+
+			# Prefer increasing progress when available (party kills can arrive without local hit signal).
+			my @increasing_candidates = grep {
+				$quest->{missions}->{$_}{mob_count} < $mission->{mob_count}
+			} @progress_candidates;
+
+			if (@increasing_candidates == 1) {
+				$mission_id = $increasing_candidates[0];
+			} elsif (@progress_candidates == 1) {
+				$mission_id = $progress_candidates[0];
+			}
+		}
+
+		unless (defined $mission_id && exists $quest->{missions}->{$mission_id}) {
+			debug TF("Quest mission update unresolved (switch: %s, quest: %s, hunt_id: %s, hunt_id_cont: %s, mob_id: %s, count: %s/%s, packet_index: %s)\n",
+				$args->{switch},
+				(defined $mission->{questID} ? $mission->{questID} : 'undef'),
+				(defined $mission->{hunt_id} ? $mission->{hunt_id} : 'undef'),
+				(defined $mission->{hunt_id_cont} ? $mission->{hunt_id_cont} : 'undef'),
+				(defined $mission->{mob_id} ? $mission->{mob_id} : 'undef'),
+				(defined $mission->{mob_count} ? $mission->{mob_count} : 'undef'),
+				(defined $mission->{mob_goal} ? $mission->{mob_goal} : 'undef'),
+				$quest_packet_index), "info";
+			next;
+		}
 
 		my $quest_mission = \%{$quest->{missions}->{$mission_id}};
+		my $old_count = $quest_mission->{mob_count};
+		my $old_goal = $quest_mission->{mob_goal};
 
 		$quest_mission->{mob_count} = $mission->{mob_count};
 		$quest_mission->{mob_goal} = $mission->{mob_goal};
+		my $mission_changed = !defined $old_count || !defined $old_goal
+			|| $old_count != $quest_mission->{mob_count}
+			|| $old_goal != $quest_mission->{mob_goal};
+		if ($used_recent_kill_fallback) {
+			delete $self->{_last_killed_monster_nameID};
+			delete $self->{_last_killed_monster_time};
+		}
 
-		debug "- MobID: $mission->{mob_id} - Name: $mission->{mob_name} - Count: $mission->{mob_count} - Goal: $mission->{mob_goal}\n", "info";
+		my $debug_mob_id = defined $mission->{mob_id} ? $mission->{mob_id} : $quest_mission->{mob_id};
+		my $debug_mob_name = (defined $mission->{mob_name} && $mission->{mob_name} ne '')
+			? $mission->{mob_name}
+			: $quest_mission->{mob_name};
+		debug "- MobID: $debug_mob_id - Name: $debug_mob_name - Count: $mission->{mob_count} - Goal: $mission->{mob_goal}\n", "info";
 
-		if ($config{questDisplayStyle}) {
+		if ($config{questDisplayStyle} && $mission_changed) {
 			if ($config{questDisplayStyle} >= 2) {
 				warning TF("[%s] Quest - defeated [%s] progress (%s/%s)\n", $quests_lut{$mission->{questID}} ? "$quests_lut{$mission->{questID}}{title} ($mission->{questID})" : $mission->{questID}, $quest_mission->{mob_name}, $quest_mission->{mob_count}, $quest_mission->{mob_goal}), "info";
 			} else {
 				warning TF("%s [%s/%s]\n", $quest_mission->{mob_name}, $quest_mission->{mob_count}, $quest_mission->{mob_goal}), "info";
 			}
 		}
-
-		$offset += $quest_info->{mission_len};
 
 		Plugins::callHook('quest_mission_updated', {
 			questID => $quest_mission->{questID},
